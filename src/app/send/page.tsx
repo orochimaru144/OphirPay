@@ -20,15 +20,21 @@ import {
   parseSubmissionError,
   SPONSOR_MIN_STARTING_BALANCE,
 } from "@/lib/stellar";
-import { formatAmount, shortenAddress } from "@/lib/utils";
+import { formatAmount, formatDate, shortenAddress } from "@/lib/utils";
 import { validateMemo } from "@/lib/validation-helpers";
 import { recordPaymentOnChain } from "@/lib/contracts";
 import { downloadReceiptPdf } from "@/lib/receipt-pdf";
-import { estimateTransactionFee } from "@/lib/fee-estimator";
+import { useFeeStats } from "@/hooks/useFeeStats";
+import {
+  FeeSelector,
+  type FeeSelection,
+} from "@/components/ui/FeeSelector";
 import { useToast } from "@/components/ui/Toast";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { useApiMutation } from "@/hooks/useApiQuery";
 import { AssetSelector } from "@/components/AssetSelector";
+import { AddressAutocomplete } from "@/components/AddressAutocomplete";
+import ScheduledPaymentsList from "@/components/ScheduledPaymentsList";
 import { XLM_ASSET, getAssetInfo, type AssetInfo } from "@/lib/assets";
 import { nextRunAt, FREQUENCY_OPTIONS, FREQUENCY_LABELS, frequencyLabel, type Frequency } from "@/lib/recurrence";
 import Link from "next/link";
@@ -67,7 +73,7 @@ type TxResult =
       id: string;
       amount: string;
       destination: string;
-      scheduledFor: string;
+      scheduledAt: string;
     }
   | { type: "error"; message: string }
   | null;
@@ -90,7 +96,13 @@ function SendPageClient() {
 
   const [destination, setDestination] = useState("");
   const [amount, setAmount] = useState("");
-  const [feeEstimate, setFeeEstimate] = useState<{ baseFee: string; congestion: string } | null>(null);
+  // Live Horizon fee tiers (#1373). `selection.fee` is what the signed
+  // transaction will carry; a `null` custom fee blocks submission.
+  const { snapshot: feeSnapshot, isLoading: feeLoading } = useFeeStats();
+  const [feeSelection, setFeeSelection] = useState<FeeSelection>({
+    tier: "recommended",
+    fee: null,
+  });
   const [memo, setMemo] = useState("");
   const [selectedAsset, setSelectedAsset] = useState<AssetInfo>(XLM_ASSET);
   const [destAsset, setDestAsset] = useState<AssetInfo>(XLM_ASSET);
@@ -98,7 +110,7 @@ function SendPageClient() {
   const [result, setResult] = useState<TxResult>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
-  const [scheduledFor, setScheduledFor] = useState("");
+  const [scheduledAt, setScheduledAt] = useState("");
 
   // Sponsored-account (new recipient) support
   const [sponsorCreate, setSponsorCreate] = useState(false);
@@ -137,6 +149,29 @@ function SendPageClient() {
   >("/api/payments", {
     invalidateKeys: [["dashboard", "payments"], ["payments", "onchain"], ["events", "onchain"]],
   });
+  const confirmPaymentRequestMutation = useApiMutation<
+    { requestId: string; transactionHash: string },
+    { status: string }
+  >(
+    ({ requestId }) => `/api/requests/${encodeURIComponent(requestId)}/paid`,
+    { invalidateKeys: [["requests"]] },
+  );
+
+  // Scheduled payments — created via the API (no wallet signing needed);
+  // the cron endpoint executes them when the date arrives.
+  const schedulePaymentMutation = useApiMutation<
+    {
+      amount: number;
+      assetCode: string;
+      assetIssuer?: string;
+      memo?: string;
+      destAddress: string;
+      scheduledAt: string;
+    },
+    { id: string }
+  >("/api/scheduled", {
+    invalidateKeys: [["scheduled"]],
+  });
 
   // Records a DB Recurrence schedule when the user picks the recurring mode.
   const createRecurrenceMutation = useApiMutation<
@@ -154,12 +189,17 @@ function SendPageClient() {
     invalidateKeys: [["recurring"]],
   });
 
-  // Fetch live fee estimate on mount
+  // Keep the selected fee in sync with each 30-second refresh. Without this,
+  // a user who opens the form during calm conditions and submits five minutes
+  // later would sign the original (possibly underbid) fee.
   useEffect(() => {
-    estimateTransactionFee(1)
-      .then((fee) => setFeeEstimate({ baseFee: fee.baseFee, congestion: fee.networkCongestion }))
-      .catch(() => {});
-  }, []);
+    if (!feeSnapshot || feeSelection.tier === "custom") return;
+    const nextFee = feeSnapshot.tiers[feeSelection.tier];
+    if (feeSelection.fee === nextFee) return;
+    setFeeSelection((current) =>
+      current.tier === feeSelection.tier ? { ...current, fee: nextFee } : current
+    );
+  }, [feeSnapshot, feeSelection.tier, feeSelection.fee]);
 
   // Pre-fill the form from a shareable payment link (?dest=...&amount=...&memo=...&asset=...)
   useEffect(() => {
@@ -327,6 +367,16 @@ function SendPageClient() {
         return false;
       }
     }
+    // Only a *custom* fee can be invalid. If live statistics have not loaded
+    // yet, submission is not blocked: the transaction builder resolves the
+    // same recommendation itself, so a Horizon hiccup can never prevent a
+    // payment from being sent.
+    if (feeSelection.tier === "custom" && feeSelection.fee === null) {
+      setValidationError(
+        "Enter a custom network fee of at least the network base fee."
+      );
+      return false;
+    }
     return true;
   };
 
@@ -349,6 +399,11 @@ function SendPageClient() {
 
     // ── Scheduled flow: persist via the API, no wallet signing ──
     if (scheduleEnabled) {
+      if (!scheduledAt || new Date(scheduledAt).getTime() <= Date.now()) {
+        setValidationError("Scheduled time must be in the future.");
+        sendInFlightRef.current = false;
+        return;
+      }
       setStep("scheduling");
       try {
         const created = await schedulePaymentMutation.mutateAsync({
@@ -357,7 +412,7 @@ function SendPageClient() {
           assetIssuer: selectedAsset.issuer,
           memo: memo.trim() || undefined,
           destAddress: destination.trim(),
-          scheduledFor: new Date(scheduledFor).toISOString(),
+          scheduledAt: new Date(scheduledAt).toISOString(),
         });
         setStep("done");
         setResult({
@@ -365,7 +420,7 @@ function SendPageClient() {
           id: created.id,
           amount,
           destination: destination.trim(),
-          scheduledFor: new Date(scheduledFor).toISOString(),
+          scheduledAt: new Date(scheduledAt).toISOString(),
         });
         toast.success(
           "Payment scheduled",
@@ -433,6 +488,7 @@ function SendPageClient() {
           destAssetIssuer: destAsset.issuer,
           path: pathEstimate.path,
           memo: memo.trim() || undefined,
+          fee: feeSelection.fee ?? undefined,
         });
         xdr = res.xdr;
       } else {
@@ -445,6 +501,7 @@ function SendPageClient() {
           assetCode: selectedAsset.code,
           assetIssuer: selectedAsset.issuer,
           sponsorCreate,
+          fee: feeSelection.fee ?? undefined,
         });
         xdr = res.xdr;
       }
@@ -465,6 +522,7 @@ function SendPageClient() {
       // 3. Submit to Horizon
       setStep("submitting");
       const response = await submitSignedTx(signedXdr);
+      const requestId = searchParams?.get("requestId");
 
       // 4. Record the payment on-chain via Soroban contract
       setStep("recording");
@@ -490,6 +548,19 @@ function SendPageClient() {
         });
       } catch {
         // Best-effort: payment already settled on-chain
+      }
+      if (requestId) {
+        try {
+          await confirmPaymentRequestMutation.mutateAsync({
+            requestId,
+            transactionHash: response.hash,
+          });
+        } catch {
+          toast.error(
+            "Payment sent",
+            "The payment request status could not be updated. The requester may need to check the transaction.",
+          );
+        }
       }
 
       // 6. Success!
@@ -810,7 +881,7 @@ function SendPageClient() {
             <div className="flex justify-between">
               <span className="text-sm text-gray-500 dark:text-gray-400">Scheduled for</span>
               <span className="text-sm font-mono text-gray-900 dark:text-white">
-                {formatDate(result.scheduledFor)}
+                {formatDate(result.scheduledAt)}
               </span>
             </div>
           </div>
@@ -1105,21 +1176,20 @@ function SendPageClient() {
             </span>
           </div>
 
-          {feeEstimate && (
-            <div className="mt-2 flex items-center gap-2 text-xs">
-              <span className="text-gray-500 dark:text-gray-400">
-                Network fee: ~{feeEstimate.baseFee} stroops
-              </span>
-              <span className={`px-1.5 py-0.5 rounded-full text-xs font-medium ${
-                feeEstimate.congestion === "low" ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" :
-                feeEstimate.congestion === "medium" ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" :
-                "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
-              }`}>
-                {feeEstimate.congestion}
-              </span>
-            </div>
-          )}
         </div>
+
+        {/* Network fee tiers (#1373) — hidden for flows that do not sign a
+            transaction now (scheduled / recurring). */}
+        {!scheduleEnabled && mode === "one-time" && (
+          <FeeSelector
+            snapshot={feeSnapshot}
+            selection={feeSelection}
+            onChange={setFeeSelection}
+            loading={feeLoading}
+            disabled={isSubmitting}
+            operations={isCrossAsset ? 1 : sponsorCreate ? 2 : 1}
+          />
+        )}
 
         {/* Cross-Asset Rate Preview Card */}
         {isCrossAsset && mode === "one-time" && (
@@ -1200,7 +1270,67 @@ function SendPageClient() {
             placeholder="e.g. Payment for services"
             className="w-full px-4 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 text-sm focus:outline-none focus:ring-2 focus:ring-ophir-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
           />
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1.5">
+            A Stellar memo is an optional note (up to 28 bytes) attached to the
+            transaction. Some exchanges and services require a memo or
+            destination tag to credit payments — include it if the recipient
+            asked for one.
+            {memo && (
+              <span className="block mt-1">
+                {(() => {
+                  const byteLen = new TextEncoder().encode(memo.trim()).byteLength;
+                  const isNearLimit = byteLen > 20;
+                  return (
+                    <span className={isNearLimit ? "text-amber-500 dark:text-amber-400" : ""}>
+                      {byteLen}/28 bytes
+                    </span>
+                  );
+                })()}
+              </span>
+            )}
+          </p>
         </div>
+
+        {/* Schedule for later */}
+        {mode === "one-time" && (
+          <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={scheduleEnabled}
+                onChange={(e) => setScheduleEnabled(e.target.checked)}
+                disabled={isSubmitting}
+                className="h-4 w-4 rounded border-gray-300 text-ophir-600 focus:ring-ophir-500"
+              />
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                Schedule this payment for later
+              </span>
+            </label>
+            {scheduleEnabled && (
+              <div className="mt-3">
+                <label
+                  htmlFor="scheduled-at"
+                  className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5"
+                >
+                  Send on
+                </label>
+                <input
+                  id="scheduled-at"
+                  type="datetime-local"
+                  value={scheduledAt}
+                  onChange={(e) => setScheduledAt(e.target.value)}
+                  disabled={isSubmitting}
+                  className="w-full px-4 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ophir-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1.5">
+                  The payment is stored as a scheduled payment and executed
+                  automatically when the date arrives. No wallet signature is
+                  needed now — you can cancel it any time before it runs.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Sponsored account creation */}
         {mode === "one-time" && recipientStatus === "unfunded" && selectedAsset.type === "native" && (
@@ -1293,11 +1423,13 @@ function SendPageClient() {
               </svg>
               {mode === "recurring"
                 ? "Schedule Recurring"
-                : isCrossAsset
-                  ? pathError
-                    ? "No Path Available"
-                    : `Send ${amount || "0"} ${selectedAsset.code} → ~${pathEstimate?.destinationAmount || "0"} ${destAsset.code}`
-                  : `Send ${selectedAsset.code}`}
+                : scheduleEnabled
+                  ? "Schedule Payment"
+                  : isCrossAsset
+                    ? pathError
+                      ? "No Path Available"
+                      : `Send ${amount || "0"} ${selectedAsset.code} → ~${pathEstimate?.destinationAmount || "0"} ${destAsset.code}`
+                    : `Send ${selectedAsset.code}`}
             </>
           )}
         </button>

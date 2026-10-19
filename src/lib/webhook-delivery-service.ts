@@ -2,7 +2,6 @@
 
 import { deliverWebhook, type WebhookDeliveryResult } from "@/lib/webhook-deliver";
 import { recordWebhookDelivery, toWebhookPayload } from "@/lib/webhook-event-store";
-import type { DeliveryStatus } from "@prisma/client";
 
 export interface RecordDeliveryOptions {
   responseCode?: number;
@@ -23,7 +22,7 @@ export async function persistDeliveryResult(
   return recordWebhookDelivery(
     webhookId,
     eventId,
-    result.success ? "SUCCESS" : "FAILED",
+    result.success ? "SUCCESS" : "DEAD_LETTER",
     {
       responseCode: result.statusCode,
       latencyMs: result.latencyMs,

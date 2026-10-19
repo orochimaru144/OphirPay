@@ -4,13 +4,14 @@ import { withMetrics } from "@/lib/metrics-middleware";
 import crypto from "crypto";
 import prisma from "@/lib/prisma";
 import {
-  successResponse,
-  validationError,
-  badRequestError,
-  unauthorizedError,
-  badRequestError,
-  handleApiError,
-} from "@/lib/api-response";
+  problemBadRequest,
+  problemFromError,
+  problemFromLegacyResponse,
+  problemFromZodError,
+  problemUnauthorized,
+} from "@/lib/api-errors";
+import { successResponse } from "@/lib/api-response";
+import { createPaymentSchema, paginationSchema } from "@/lib/validation-schemas";
 import { logger } from "@/lib/logger";
 import { withRequestLogging } from "@/lib/request-logging";
 import { getAuthContext } from "@/lib/auth-session";
@@ -19,20 +20,23 @@ import { dispatchWebhookEventAsync } from "@/lib/webhook-dispatcher";
 import { WEBHOOK_EVENTS } from "@/app/api/webhooks/event-types";
 import { incMetric } from "@/lib/metrics-counters";
 import { buildPaymentWhere } from "@/lib/payment-filters";
+import { invalidateCaches } from "@/lib/api-cache";
 import {
   buildCursorWhere,
   computeNextCursor,
+  computePagination,
   decodeCursor,
   prismaPagination,
 } from "@/lib/pagination-utils";
 
 export const GET = withMetrics("GET /api/payments", withRequestLogging(async function GET(request: Request) {
+  // Errors on this endpoint are RFC 7807 problem documents (issue #1364), so
+  // the SDK can read one shape for both the list and the mutations.
+  const instance = new URL(request.url).pathname;
   try {
     const auth = await getAuthContext(request);
     if (!auth) {
-      return unauthorizedError(
-        "Authentication required. Connect your wallet or provide an API key."
-      );
+      return problemUnauthorized(undefined, { instance });
     }
 
     const { searchParams } = new URL(request.url);
@@ -47,7 +51,7 @@ export const GET = withMetrics("GET /api/payments", withRequestLogging(async fun
       search: searchParams.get("search") ?? undefined,
     });
 
-    if (!parsed.success) return validationError(parsed.error);
+    if (!parsed.success) return problemFromZodError(parsed.error, { instance });
 
     const { page, limit, status, search, cursor: rawCursor } = parsed.data;
 
@@ -60,8 +64,6 @@ export const GET = withMetrics("GET /api/payments", withRequestLogging(async fun
     // `status` and `search` (memo ILIKE + exact tx-hash, Issue #157) use the
     // shared helper so the list route and CSV export stay in lockstep.
     const baseWhere = buildPaymentWhere(auth.userId, { status, search });
-    // Soft-deleted rows are hidden by default (issue #50). `includeDeleted` is
-    // the explicit admin/debug opt-in to see them.
     if (!includeDeleted) baseWhere.deletedAt = null;
 
     // Keyset (cursor) pagination is the default for plain list requests — it
@@ -69,67 +71,84 @@ export const GET = withMetrics("GET /api/payments", withRequestLogging(async fun
     // pagination via an explicit `page` param is kept for legacy consumers.
     const cursor = rawCursor ? decodeCursor(rawCursor) : null;
     if (rawCursor && !cursor) {
-      return badRequestError("Invalid cursor");
+      return problemBadRequest("Invalid cursor", {
+        instance,
+        code: "INVALID_CURSOR",
+      });
+    }
+    if (cursor !== null && explicitPage !== null) {
+      return problemBadRequest("page and cursor cannot both be used", {
+        instance,
+      });
     }
 
-    const useCursor = cursor !== null || explicitPage === null;
-    const where = buildCursorWhere(baseWhere, cursor);
-
-    const [payments, total] = await Promise.all([
-      prisma.payment.findMany({
+    // Keyset mode (default): fetch limit + 1 rows to learn whether another
+    // page exists. The COUNT is expensive, so it only runs when the caller
+    // explicitly asks for meta.total via includeTotal=true.
+    if (cursor !== null || explicitPage === null) {
+      const where = buildCursorWhere(baseWhere, cursor);
+      const rows = await prisma.payment.findMany({
         where,
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         // Fetch one extra row to learn whether another page exists.
-        ...(useCursor ? { take: limit + 1 } : prismaPagination(page, limit)),
+        take: limit + 1,
+      });
+      const visible = rows.slice(0, limit);
+      const { nextCursor, hasMore } = computeNextCursor(rows, limit);
+      const meta: Record<string, unknown> = { limit, nextCursor, hasMore };
+      if (searchParams.get("includeTotal") === "true") {
+        meta.total = await prisma.payment.count({ where: baseWhere });
+      }
+      return successResponse(visible, meta);
+    }
+
+    // Legacy offset mode: an explicit `page` param. Needs the COUNT to build
+    // the navigation meta (totalPages / hasNext / hasPrev).
+    const [payments, total] = await Promise.all([
+      prisma.payment.findMany({
+        where: baseWhere,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        ...prismaPagination(page, limit),
       }),
       prisma.payment.count({ where: baseWhere }),
     ]);
 
-    // Fetch one extra row to cheaply determine whether another page exists.
-    const rows = await prisma.payment.findMany({
-      where: keysetWhere,
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
-    });
-
-    const visible = useCursor ? payments.slice(0, limit) : payments;
-    const pageInfo = useCursor
-      ? computeNextCursor(payments, limit)
-      : { nextCursor: null, hasMore: page * limit < total };
-
-    return successResponse(visible, {
-      page,
-      limit,
-      total,
-      nextCursor: pageInfo.nextCursor,
-      hasMore: pageInfo.hasMore,
+    return successResponse(payments, {
+      ...computePagination(page, limit, total),
+      // Keyset-shaped fields kept for consumers that page via hasMore;
+      // offset mode never returns a cursor.
+      nextCursor: null,
+      hasMore: page * limit < total,
     });
   } catch (err) {
-    return handleApiError(err, `GET /api/payments/[id]`);
+    return problemFromError(err, instance);
   }
 }));
 
 export const POST = withMetrics("POST /api/payments", withRequestLogging(async function POST(request: Request) {
+  const instance = new URL(request.url).pathname;
   try {
     const csrfError = verifyCsrf(request);
-    if (csrfError) return csrfError;
+    // The CSRF guard runs before this handler and answers in the legacy
+    // envelope; re-render it so no error on this route bypasses RFC 7807.
+    if (csrfError) return problemFromLegacyResponse(csrfError, instance);
 
     const auth = await getAuthContext(request);
     if (!auth) {
-      return unauthorizedError(
-        "Authentication required. Connect your wallet or provide an API key."
-      );
+      return problemUnauthorized(undefined, { instance });
     }
 
-    const parsed = await validateIdParam(params);
-    if (!parsed.success) return parsed.response;
-    const { id } = parsed;
+    // A body that is not JSON is a client error (400), not a server fault —
+    // `request.json()` throws a SyntaxError that would otherwise classify as 500.
+    const body = await request.json().catch(() => null);
+    if (body === null) {
+      return problemBadRequest("Request body must be valid JSON", { instance });
+    }
 
-    const body = await request.json() as { status?: string; description?: string; memo?: string };
+    const parsed = createPaymentSchema.safeParse(body);
+    if (!parsed.success) return problemFromZodError(parsed.error, { instance });
 
-    // updateMany scopes the write to the authenticated user's records
-    const updated = await prisma.payment.updateMany({
-      where: { id, userId: auth.userId },
+    const payment = await prisma.payment.create({
       data: {
         amount: parsed.data.amount,
         assetCode: parsed.data.assetCode,
@@ -145,64 +164,37 @@ export const POST = withMetrics("POST /api/payments", withRequestLogging(async f
         // wrote a Stellar address into userId, breaking the relation).
         userId: auth.userId,
         sourceAccountId: parsed.data.sourceAccountId,
-        // Persist the destination Stellar address (not modeled as its own
-        // column) so payment-detail receipts can render the recipient.
-        metadata: parsed.data.destAddress
-          ? JSON.stringify({ destAddress: parsed.data.destAddress })
-          : undefined,
       },
     });
-    if (updated.count === 0) return notFoundError("Payment");
 
-    const payment = await prisma.payment.findUnique({ where: { id } });
-    if (!payment) return notFoundError("Payment");
+    logger.info("Payment created", { id: payment.id, amount: payment.amount });
 
-    logger.info("Payment updated", { id, status: payment.status });
-
-    if (body.status === "SIGNED") {
-      dispatchWebhookEventAsync(WEBHOOK_EVENTS.PAYMENT_SIGNED, {
+    dispatchWebhookEventAsync(
+      WEBHOOK_EVENTS.PAYMENT_CREATED,
+      {
         paymentId: payment.id,
         amount: payment.amount,
         assetCode: payment.assetCode,
         status: payment.status,
-        signedAt: new Date().toISOString(),
-      });
-    } else if (body.status === "SUBMITTED") {
-      dispatchWebhookEventAsync(WEBHOOK_EVENTS.PAYMENT_SUBMITTED, {
-        paymentId: payment.id,
-        amount: payment.amount,
-        assetCode: payment.assetCode,
-        transactionHash: payment.transactionHash,
-        submittedAt: new Date().toISOString(),
-      });
-    } else if (body.status === "CONFIRMED") {
-      dispatchWebhookEventAsync(WEBHOOK_EVENTS.PAYMENT_CONFIRMED, {
-        paymentId: payment.id,
-        amount: payment.amount,
-        assetCode: payment.assetCode,
-        transactionHash: payment.transactionHash,
-        confirmedAt: new Date().toISOString(),
-      });
-    } else if (body.status === "COMPLETED") {
-      dispatchWebhookEventAsync(WEBHOOK_EVENTS.PAYMENT_COMPLETED, {
-        paymentId: payment.id,
-        amount: payment.amount,
-        assetCode: payment.assetCode,
-        transactionHash: payment.transactionHash,
-        completedAt: payment.completedAt?.toISOString() ?? new Date().toISOString(),
-      });
-    } else if (body.status === "FAILED") {
-      dispatchWebhookEventAsync(WEBHOOK_EVENTS.PAYMENT_FAILED, {
-        paymentId: payment.id,
-        amount: payment.amount,
-        assetCode: payment.assetCode,
-        errorMessage: payment.errorMessage,
-        failedAt: new Date().toISOString(),
-      });
-    }
+        createdAt: payment.createdAt.toISOString(),
+      },
+      auth.userId
+    );
 
-    return successResponse(payment);
+    incMetric("payments_created_total");
+
+    // Explicit cache invalidation (#741): a new payment changes the aggregate
+    // stats, this user's analytics, and the audit ledger (recording a payment
+    // appends an on-chain audit entry). Analytics is invalidated per-user so
+    // one tenant's write never flushes everyone else's cached aggregates.
+    await invalidateCaches([
+      { scope: "stats" },
+      { scope: "analytics", subject: auth.userId },
+      { scope: "audit-log" },
+    ]);
+
+    return successResponse(payment, undefined, 201);
   } catch (err) {
-    return handleApiError(err, `PATCH /api/payments/[id]`);
+    return problemFromError(err, instance);
   }
 }));

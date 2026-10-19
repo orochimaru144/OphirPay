@@ -65,6 +65,16 @@ function renderPage() {
   );
 }
 
+// PaymentsPage renders five skeleton <tr> rows while the on-chain read is in
+// flight, then swaps in the real rows. findAllByRole("row") resolves on the
+// FIRST skeleton row, which races the data fetch — so wait until the skeleton
+// rows are gone (header row + the two data rows) before querying row content.
+async function waitForLoadedTable() {
+  await waitFor(() => {
+    expect(screen.getAllByRole("row")).toHaveLength(3);
+  });
+}
+
 beforeEach(() => {
   mocks.fetchOnChainPayments.mockReset();
   mocks.fetchMock.mockReset();
@@ -78,7 +88,7 @@ beforeEach(() => {
 describe("PaymentsPage optimistic cancel (Issue #47)", () => {
   it("shows a cancel button for RECORDED payments but not CANCELLED ones", async () => {
     renderPage();
-    await screen.findAllByRole("row");
+    await waitForLoadedTable();
 
     // The RECORDED payment should have a cancel button
     expect(
@@ -93,9 +103,21 @@ describe("PaymentsPage optimistic cancel (Issue #47)", () => {
 
   it("optimistically flips the status to CANCELLED on click, then reconciles on success", async () => {
     mocks.fetchMock.mockResolvedValue({ ok: true });
+    // Initial load returns #1 as RECORDED; the post-cancel refetch returns it
+    // as CANCELLED (the server flipped it), so the button stays hidden after
+    // the optimistic state is reconciled away.
+    mocks.fetchOnChainPayments
+      .mockResolvedValueOnce({
+        payments: [recordedPayment, cancelledPayment],
+        total: 2,
+      })
+      .mockResolvedValueOnce({
+        payments: [{ ...recordedPayment, metadata: "CANCELLED" }, cancelledPayment],
+        total: 2,
+      });
 
     renderPage();
-    await screen.findAllByRole("row");
+    await waitForLoadedTable();
 
     const cancelBtn = screen.getByRole("button", { name: /cancel payment #1/i });
     fireEvent.click(cancelBtn);
@@ -127,7 +149,7 @@ describe("PaymentsPage optimistic cancel (Issue #47)", () => {
     mocks.fetchMock.mockResolvedValue({ ok: false, status: 500 });
 
     renderPage();
-    await screen.findAllByRole("row");
+    await waitForLoadedTable();
 
     const cancelBtn = screen.getByRole("button", { name: /cancel payment #1/i });
     fireEvent.click(cancelBtn);
@@ -165,7 +187,7 @@ describe("PaymentsPage optimistic cancel (Issue #47)", () => {
     mocks.fetchMock.mockRejectedValue(new TypeError("Network error"));
 
     renderPage();
-    await screen.findAllByRole("row");
+    await waitForLoadedTable();
 
     const cancelBtn = screen.getByRole("button", { name: /cancel payment #1/i });
     fireEvent.click(cancelBtn);

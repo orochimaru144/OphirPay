@@ -2,16 +2,19 @@
 import { withMetrics } from "@/lib/metrics-middleware";
 
 import prisma from "@/lib/prisma";
+import { successResponse } from "@/lib/api-response";
 import {
-  successResponse,
-  validationError,
-  unauthorizedError,
-  notFoundError,
-  handleApiError,
-} from "@/lib/api-response";
+  problemBadRequest,
+  problemFromError,
+  problemFromLegacyResponse,
+  problemFromZodError,
+  problemNotFound,
+  problemUnauthorized,
+} from "@/lib/api-errors";
 import { logger } from "@/lib/logger";
 import { getAuthContext } from "@/lib/auth-session";
 import { withRequestLogging } from "@/lib/request-logging";
+import { verifyCsrf } from "@/lib/csrf";
 import { z } from "zod";
 
 const cancelPaymentSchema = z.object({
@@ -27,31 +30,38 @@ const cancelPaymentSchema = z.object({
 export const POST = withMetrics("POST /api/payments/cancel", withRequestLogging(async function POST(
   request: Request
 ) {
+  const instance = new URL(request.url).pathname;
   try {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return problemFromLegacyResponse(csrfError, instance);
+
     const auth = await getAuthContext(request);
     if (!auth) {
-      return unauthorizedError(
-        "Authentication required. Connect your wallet or provide an API key."
-      );
+      return problemUnauthorized(undefined, { instance });
     }
 
-    const rawBody = await request.json();
+    const rawBody = await request.json().catch(() => null);
+    if (rawBody === null) {
+      return problemBadRequest("Request body must be valid JSON", { instance });
+    }
     const parsed = cancelPaymentSchema.safeParse(rawBody);
-    if (!parsed.success) return validationError(parsed.error);
+    if (!parsed.success) return problemFromZodError(parsed.error, { instance });
     const { txHash } = parsed.data;
 
     const updated = await prisma.payment.updateMany({
       where: { transactionHash: txHash, userId: auth.userId, deletedAt: null },
       data: { status: "CANCELLED" },
     });
-    if (updated.count === 0) return notFoundError("Payment");
+    if (updated.count === 0) return problemNotFound("Payment", { instance });
 
-    const payment = await prisma.payment.findUnique({ where: { id } });
-    if (!payment) return notFoundError("Payment");
+    const payment = await prisma.payment.findFirst({
+      where: { transactionHash: txHash, userId: auth.userId, deletedAt: null },
+    });
+    if (!payment) return problemNotFound("Payment", { instance });
 
-    logger.info("Payment cancelled", { id, status: payment.status });
+    logger.info("Payment cancelled", { id: payment.id, status: payment.status });
     return successResponse(payment);
   } catch (err) {
-    return handleApiError(err, "POST /api/payments/cancel");
+    return problemFromError(err, instance);
   }
 }));

@@ -3,6 +3,8 @@
 
 import { useState, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { usePageTitle } from "@/hooks/usePageTitle";
+import { PAGE_TITLES } from "@/lib/page-titles";
 import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -10,20 +12,15 @@ import { Badge } from "@/components/ui/Badge";
 import { Card } from "@/components/ui/Card";
 import { useToast } from "@/components/ui/Toast";
 import { useWallet } from "@/hooks/useMultiWallet";
+import { useAdminSudo } from "@/hooks/useAdminSudo";
+import { authorizeAdminAction, SudoDeclinedError } from "@/lib/sudo-client";
 import { setFeeConfig, setFeeCollector } from "@/lib/contract-advanced";
-import { 
-  validateFeeBps, 
+import {
+  validateFeeBps,
   validateFeeConfig,
   MAX_FEE_BPS,
   useFeeConfig,
-  type FeeConfigData,
 } from "@/lib/fee-config";
-
-interface TxStatus {
-  type: "success" | "error";
-  message: string;
-  txHash?: string;
-}
 
 interface TxStatus {
   type: "success" | "error";
@@ -36,7 +33,10 @@ export default function FeeConfigPage() {
   const toast = useToast();
   const { wallet } = useWallet();
   const queryClient = useQueryClient();
-  
+  // Sudo mode (issue #1389): fee-config changes require a wallet verification
+  // newer than 15 minutes. The modal renders at the end of the page.
+  const sudo = useAdminSudo();
+
   // State declarations - THESE WERE MISSING
   const [collector, setCollector] = useState<string | null>(null);
   const [showFeeModal, setShowFeeModal] = useState(false);
@@ -67,18 +67,6 @@ export default function FeeConfigPage() {
     }
   }, [config]);
 
-  // Initialize form values from config when loaded
-  useEffect(() => {
-    if (config) {
-      setFormPaymentFee(config.payment_fee_bps);
-      setFormEscrowFee(config.escrow_fee_bps);
-      setFormStreamFee(config.stream_fee_bps);
-      setFormBatchBase(config.batch_base_fee);
-      setFormBatchPerItem(config.batch_per_item_fee);
-      setFormEnabled(config.enabled);
-    }
-  }, [config]);
-
   const handleFeeSubmit = async () => {
     if (!wallet.publicKey) { 
       toast.error("Connect your wallet first"); 
@@ -95,16 +83,30 @@ export default function FeeConfigPage() {
     
     setValidationErrors([]);
     setSubmitting(true);
-    setTxStatus(null);
-    
-    try {
+    setTxStatus(null);    try {
+      // Sudo step-up: authorize server-side (re-signing the wallet challenge
+      // if the session verification is stale) before the on-chain write.
+      await authorizeAdminAction(
+        "/api/fee-config",
+        {
+          action: "set_fee_config",
+          paymentFeeBps: formPaymentFee,
+          escrowFeeBps: formEscrowFee,
+          streamFeeBps: formStreamFee,
+          batchBaseFee: formBatchBase,
+          batchPerItemFee: formBatchPerItem,
+          enabled: formEnabled,
+        },
+        { signMessage: sudo.signMessage, requestReauth: sudo.requestReauth },
+      );
+
       const result = await setFeeConfig(
         wallet.publicKey,
         formPaymentFee, 
         formEscrowFee, 
         formStreamFee,
-        formBatchBase, 
-        formBatchPerItem, 
+        formBatchBase,
+        formBatchPerItem,
         formEnabled,
       );
       
@@ -125,7 +127,12 @@ export default function FeeConfigPage() {
         toast.error(result.error || "Failed to update fee config");
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : "Network error";
+      const errorMsg =
+        error instanceof SudoDeclinedError
+          ? "Re-authentication cancelled — fees were not changed."
+          : error instanceof Error
+            ? error.message
+            : "Network error";
       setTxStatus({
         type: "error",
         message: errorMsg,
@@ -151,6 +158,12 @@ export default function FeeConfigPage() {
     setTxStatus(null);
     
     try {
+      await authorizeAdminAction(
+        "/api/fee-config",
+        { action: "set_fee_collector", collector: formCollector },
+        { signMessage: sudo.signMessage, requestReauth: sudo.requestReauth },
+      );
+
       const result = await setFeeCollector(wallet.publicKey, formCollector);
       if (result.success) {
         setTxStatus({
@@ -169,7 +182,12 @@ export default function FeeConfigPage() {
         toast.error(result.error || "Failed to update collector");
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : "Network error";
+      const errorMsg =
+        error instanceof SudoDeclinedError
+          ? "Re-authentication cancelled — the collector was not changed."
+          : error instanceof Error
+            ? error.message
+            : "Network error";
       setTxStatus({
         type: "error",
         message: errorMsg,
@@ -472,6 +490,9 @@ export default function FeeConfigPage() {
           </Button>
         </div>
       </Modal>
+
+      {/* Sudo-mode re-authentication prompt (issue #1389) */}
+      {sudo.modal}
     </div>
   );
 }

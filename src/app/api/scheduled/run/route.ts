@@ -14,13 +14,16 @@ import {
 import { ERROR_CODES } from "@/lib/error-codes";
 import { logger } from "@/lib/logger";
 import { withRequestLogging } from "@/lib/request-logging";
+import { verifyCsrf } from "@/lib/csrf";
 
 /**
  * Cron endpoint — executes due scheduled payments.
  *
- * Invoked by the Vercel cron defined in vercel.json. Vercel sends
- * `Authorization: Bearer $CRON_SECRET` when the CRON_SECRET env var is set,
- * so the handler accepts either that header or `x-cron-secret`.
+ * The automated every-5-minute sweep now runs from GitHub Actions against
+ * `/api/cron` (see .github/workflows/scheduled-payments-cron.yml and
+ * docs/scheduled-payment-cron.md). This route is kept as an equivalent
+ * on-demand trigger: it accepts `Authorization: Bearer $CRON_SECRET` or the
+ * `x-cron-secret` header.
  *
  * If `SCHEDULED_PAYMENTS_SOURCE_SECRET` is not configured the endpoint
  * refuses to run (503) without touching any records, so a misconfigured
@@ -38,6 +41,12 @@ function isAuthorizedCron(request: Request): boolean {
 
 async function runCron(request: Request) {
   try {
+    // POST is the manual trigger; GET is the Vercel Cron invocation. CSRF
+    // is enforced for POST only (Bearer / x-cron-secret callers bypass
+    // inside verifyCsrf).
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
     if (!isAuthorizedCron(request)) {
       return unauthorizedError("Invalid cron secret");
     }

@@ -33,7 +33,7 @@ vi.mock("@/lib/wallets", () => ({
 }));
 
 vi.mock("@/lib/stellar", () => ({
-  isValidStellarAddress: vi.fn(() => true),
+  isValidStellarAddress: vi.fn(() => true), accountExists: vi.fn(() => Promise.resolve(true)),
   buildPaymentTx: vi.fn(),
   submitSignedTx: vi.fn(),
   getStellarExplorerUrl: vi.fn((h: string) => `https://stellar.expert/explorer/testnet/tx/${h}`),
@@ -44,6 +44,29 @@ vi.mock("@/lib/stellar", () => ({
 
 vi.mock("@/lib/contracts", () => ({
   recordPaymentOnChain: vi.fn(),
+}));
+
+vi.mock("@/hooks/useFeeStats", () => ({
+  useFeeStats: () => ({
+    snapshot: {
+      tiers: {
+        baseFee: 100,
+        low: 100,
+        recommended: 100,
+        fast: 150,
+        percentiles: { low: "p50", recommended: "p90", fast: "p99" },
+      },
+      congestion: "low",
+      ledgerCapacityUsage: 0.1,
+      source: "horizon",
+      stale: false,
+      fetchedAt: "2026-01-01T00:00:00.000Z",
+      basis: "p90 of recently charged fees",
+    },
+    isLoading: false,
+    error: null,
+    refresh: vi.fn(),
+  }),
 }));
 
 vi.mock("@/lib/fee-estimator", () => ({
@@ -166,9 +189,9 @@ describe("SendPage scheduling", () => {
       destAddress: RECIPIENT,
       memo: "September payout",
     });
-    // scheduledFor must match the chosen local datetime (instant-safe)
+    // scheduledAt must match the chosen local datetime (instant-safe)
     expect(
-      new Date(String(createdBodies[0].scheduledFor)).getTime()
+      new Date(String(createdBodies[0].scheduledAt)).getTime()
     ).toBe(new Date("2099-01-01T10:00").getTime());
   });
 
@@ -218,7 +241,7 @@ describe("ScheduledPaymentsList", () => {
                 assetCode: "XLM",
                 destAddress: RECIPIENT,
                 memo: "Payout",
-                scheduledFor: "2099-01-01T10:00:00.000Z",
+                scheduledAt: "2099-01-01T10:00:00.000Z",
                 status: "SCHEDULED",
               },
               {
@@ -226,7 +249,7 @@ describe("ScheduledPaymentsList", () => {
                 amount: "25",
                 assetCode: "XLM",
                 destAddress: PUBLIC_KEY,
-                scheduledFor: "2099-02-01T10:00:00.000Z",
+                scheduledAt: "2099-02-01T10:00:00.000Z",
                 status: "EXECUTED",
                 transactionHash: "tx123",
               },
@@ -268,7 +291,7 @@ describe("ScheduledPaymentsList", () => {
                 amount: "100",
                 assetCode: "XLM",
                 destAddress: RECIPIENT,
-                scheduledFor: "2099-01-01T10:00:00.000Z",
+                scheduledAt: "2099-01-01T10:00:00.000Z",
                 status: "SCHEDULED",
               },
             ],
